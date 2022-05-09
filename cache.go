@@ -46,6 +46,11 @@ type Cache[K comparable, V any] struct {
 			nextID uint64
 			fns    map[uint64]func(*Item[K, V])
 		}
+		updating struct {
+			mu     sync.RWMutex
+			nextID uint64
+			fns    map[uint64]func(*Item[K, V])
+		}
 		eviction struct {
 			mu     sync.RWMutex
 			nextID uint64
@@ -67,6 +72,7 @@ func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
 	c.items.expQueue = newExpirationQueue[K, V]()
 	c.items.timerCh = make(chan time.Duration, 1) // buffer is important
 	c.events.insertion.fns = make(map[uint64]func(*Item[K, V]))
+	c.events.updating.fns = make(map[uint64]func(*Item[K, V]))
 	c.events.eviction.fns = make(map[uint64]func(EvictionReason, *Item[K, V]))
 
 	applyOptions(&c.options, opts...)
@@ -137,6 +143,12 @@ func (c *Cache[K, V]) set(key K, value V, ttl time.Duration) *Item[K, V] {
 		item := elem.Value.(*Item[K, V])
 		item.update(value, ttl)
 		c.updateExpirations(false, elem)
+
+		c.events.updating.mu.RLock()
+		for _, fn := range c.events.updating.fns {
+			fn(item)
+		}
+		c.events.updating.mu.RUnlock()
 
 		return item
 	}
@@ -471,6 +483,44 @@ func (c *Cache[K, V]) OnInsertion(fn func(context.Context, *Item[K, V])) func() 
 		c.events.insertion.mu.Lock()
 		delete(c.events.insertion.fns, id)
 		c.events.insertion.mu.Unlock()
+
+		wg.Wait()
+	}
+}
+
+// OnUpdating adds the provided function to be executed when
+// a item is updating in the cache. The function is executed
+// on a separate goroutine and does not block the flow of the cache
+// manager.
+// The returned function may be called to delete the subscription function
+// from the list of insertion subscribers.
+// When the returned function is called, it blocks until all instances of
+// the same subscription function return. A context is used to notify the
+// subscription function when the returned/deletion function is called.
+func (c *Cache[K, V]) OnUpdating(fn func(context.Context, *Item[K, V])) func() {
+	var (
+		wg          sync.WaitGroup
+		ctx, cancel = context.WithCancel(context.Background())
+	)
+
+	c.events.updating.mu.Lock()
+	id := c.events.updating.nextID
+	c.events.updating.fns[id] = func(item *Item[K, V]) {
+		wg.Add(1)
+		go func() {
+			fn(ctx, item)
+			wg.Done()
+		}()
+	}
+	c.events.updating.nextID++
+	c.events.updating.mu.Unlock()
+
+	return func() {
+		cancel()
+
+		c.events.updating.mu.Lock()
+		delete(c.events.updating.fns, id)
+		c.events.updating.mu.Unlock()
 
 		wg.Wait()
 	}
